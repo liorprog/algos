@@ -1,0 +1,53 @@
+"""
+examples/example_two_vectors.py
+
+Reproduce the numeric example described in the PR text: two nearby 2D vectors,
+accumulate with gaussian, then post-process with zeroing small values and
+dividing large ones, and extract peaks.
+"""
+from algos.mesh import MeshND
+import pprint
+
+def recursive_sum_list(nested):
+    if isinstance(nested, list):
+        return [recursive_sum_list(x) for x in nested]
+    return nested
+
+def flatten_counts(nested, prefix=()):
+    """Yield (index_tuple, value) for nested counts."""
+    if not isinstance(nested, list):
+        yield tuple(prefix), nested
+    else:
+        for i, v in enumerate(nested):
+            yield from flatten_counts(v, prefix + (i,))
+
+def main():
+    mesh = MeshND(bounds=[(0,1),(0,1)], cells=[5,5])
+    p1 = [0.48, 0.52]
+    p2 = [0.51, 0.49]
+
+    mesh.add(p1, amount=1.0, radius=0.25, mode='gaussian', normalize=False)
+    mesh.add(p2, amount=1.0, radius=0.25, mode='gaussian', normalize=False)
+
+    print("Counts before post-processing (non-zero cells):")
+    for idx, v in flatten_counts(mesh.get_counts()):
+        if v != 0.0:
+            print(idx, round(v, 6))
+
+    # Post-process
+    mesh.normalize_counts(low_threshold=0.12, zero_small=True,
+                          high_threshold=1.0, divide_const=2.0, cap_only=False)
+
+    print("\nCounts after normalize_counts(low_threshold=0.12, high_threshold=1.0, divide_const=2.0):")
+    for idx, v in flatten_counts(mesh.get_counts()):
+        if v != 0.0:
+            print(idx, round(v, 6))
+
+    peaks = mesh.get_peaks(min_value=0.5, neighborhood=1)
+    print("\nPeaks (index, value):", peaks)
+    centers = mesh.get_centers()
+    mapped = [([centers[d][idx[d]] for d in range(len(idx))], v) for idx, v in peaks]
+    print("Peaks mapped to coordinates:", mapped)
+
+if __name__ == '__main__':
+    main()
