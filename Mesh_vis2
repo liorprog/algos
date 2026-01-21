@@ -1,0 +1,257 @@
+"""
+algos/mesh_visualizer.py
+
+Qt-based visualizer for a 2D MeshND (pure-Python nested-list mesh).
+
+Enhancements for the combined example:
+- Accepts `true_points` (list of real coordinates) and draws them as red X markers.
+- Supports a simple blue-only heatmap mode (so grid amplitudes appear blue).
+- Provides setters for mesh, peaks, and true_points so an external controller can update
+  the display repeatedly (for animation / cycles).
+
+Depends on PyQt5 (pip install PyQt5). If you prefer PySide6, replace the import:
+    from PySide6 import QtWidgets, QtGui, QtCore
+"""
+from typing import List, Tuple, Optional
+import math
+
+from PyQt5 import QtWidgets, QtGui, QtCore
+
+
+class MeshVisualizer(QtWidgets.QWidget):
+    """
+    QWidget that draws a 2D mesh (heatmap) from a MeshND instance.
+
+    Important: expects mesh.ndim == 2.
+    """
+
+    def __init__(
+        self,
+        mesh,
+        peaks: Optional[List[Tuple[Tuple[int, int], float]]] = None,
+        true_points: Optional[List[Tuple[float, float]]] = None,
+        show_values: bool = False,
+        blue_heatmap: bool = False,
+        parent=None,
+    ):
+        super().__init__(parent)
+        if mesh.ndim != 2:
+            raise ValueError("MeshVisualizer currently only supports 2D meshes.")
+        self.mesh = mesh
+        self.peaks = peaks or []
+        self.true_points = true_points or []
+        self.show_values = show_values
+        self.blue_heatmap = blue_heatmap
+        # caches
+        self._max_value = None
+        self.setMouseTracking(True)  # track mouse to show tooltips
+        self.setMinimumSize(300, 300)
+
+    def set_mesh(self, mesh):
+        if mesh.ndim != 2:
+            raise ValueError("MeshVisualizer currently only supports 2D meshes.")
+        self.mesh = mesh
+        self._max_value = None
+        self.update()
+
+    def set_peaks(self, peaks: List[Tuple[Tuple[int, int], float]]):
+        self.peaks = peaks or []
+        self.update()
+
+    def set_true_points(self, true_points: List[Tuple[float, float]]):
+        self.true_points = true_points or []
+        self.update()
+
+    def sizeHint(self):
+        return QtCore.QSize(600, 600)
+
+    def paintEvent(self, event):
+        painter = QtGui.QPainter(self)
+        painter.setRenderHint(QtGui.QPainter.Antialiasing, False)
+
+        counts = self.mesh.get_counts()
+        nx = self.mesh.cells[0]
+        ny = self.mesh.cells[1]
+
+        w = self.width()
+        h = self.height()
+
+        # compute cell pixel sizes (we map ix -> x, iy -> y with iy increasing downward)
+        cell_w = w / nx
+        cell_h = h / ny
+
+        # compute max for color normalization
+        if self._max_value is None:
+            m = 0.0
+            for i in range(nx):
+                for j in range(ny):
+                    v = counts[i][j]
+                    if v > m:
+                        m = v
+            self._max_value = m if m > 0 else 1.0  # avoid division by zero
+
+        maxv = self._max_value
+
+        # draw cells
+        for i in range(nx):
+            x = i * cell_w
+            for j in range(ny):
+                y = j * cell_h
+                v = counts[i][j]
+                if self.blue_heatmap:
+                    color = self._value_to_blue(v, maxv)
+                else:
+                    color = self._value_to_color(v, maxv)
+                painter.fillRect(QtCore.QRectF(x, y, cell_w + 0.5, cell_h + 0.5), color)
+
+        # optionally draw grid lines (light)
+        pen = QtGui.QPen(QtGui.QColor(0, 0, 0, 40))
+        pen.setWidth(0)
+        painter.setPen(pen)
+        for i in range(1, nx):
+            xpos = i * cell_w
+            painter.drawLine(QtCore.QLineF(xpos, 0, xpos, h))
+        for j in range(1, ny):
+            ypos = j * cell_h
+            painter.drawLine(QtCore.QLineF(0, ypos, w, ypos))
+
+        # draw peaks as white-circled red dots
+        if self.peaks:
+            pen = QtGui.QPen(QtGui.QColor(255, 255, 255))
+            pen.setWidth(2)
+            painter.setPen(pen)
+            brush = QtGui.QBrush(QtGui.QColor(255, 0, 0, 200))
+            painter.setBrush(brush)
+            for idx, val in self.peaks:
+                i, j = idx
+                cx = (i + 0.5) * cell_w
+                cy = (j + 0.5) * cell_h
+                radius = min(cell_w, cell_h) * 0.25
+                painter.drawEllipse(QtCore.QPointF(cx, cy), radius, radius)
+                painter.setPen(QtGui.QPen(QtGui.QColor(255, 255, 255)))
+                painter.drawText(QtCore.QPointF(cx + radius + 2, cy), f"{round(val,3)}")
+
+        # draw true points as red X marks (real coordinates)
+        if self.true_points:
+            pen = QtGui.QPen(QtGui.QColor(200, 10, 10))
+            pen.setWidth(2)
+            painter.setPen(pen)
+            for (tx, ty) in self.true_points:
+                px = self._coord_to_pixel_x(tx, w)
+                py = self._coord_to_pixel_y(ty, h)
+                size = min(cell_w, cell_h) * 0.4
+                painter.drawLine(px - size, py - size, px + size, py + size)
+                painter.drawLine(px - size, py + size, px + size, py - size)
+
+        # optionally draw numeric values (only if requested and scale allows)
+        if self.show_values:
+            painter.setPen(QtGui.QPen(QtGui.QColor(0, 0, 0)))
+            font = painter.font()
+            font.setPointSize(8)
+            painter.setFont(font)
+            for i in range(nx):
+                x = i * cell_w
+                for j in range(ny):
+                    y = j * cell_h
+                    v = counts[i][j]
+                    if v != 0:
+                        painter.drawText(QtCore.QRectF(x, y, cell_w, cell_h), QtCore.Qt.AlignCenter, f"{v:.2f}")
+
+    def _value_to_color(self, v: float, maxv: float) -> QtGui.QColor:
+        """
+        Map value v (0..maxv) to a QColor using blue->red HSV interpolation.
+        """
+        if v <= 0:
+            return QtGui.QColor(30, 30, 30)
+        frac = max(0.0, min(1.0, v / float(maxv)))
+        hue_blue = 0.66  # blue
+        hue_red = 0.0
+        hue = hue_blue * (1.0 - frac) + hue_red * frac
+        qcol = QtGui.QColor()
+        qcol.setHsvF(hue, 0.85, 0.9)
+        return qcol
+
+    def _value_to_blue(self, v: float, maxv: float) -> QtGui.QColor:
+        """
+        Map value v to a blue-only color ramp: dark -> bright blue.
+        """
+        if v <= 0:
+            return QtGui.QColor(10, 10, 30)  # dark background
+        frac = max(0.0, min(1.0, v / float(maxv)))
+        blue = int(60 + 195 * frac)  # from 60 -> 255
+        return QtGui.QColor(20, 20, blue)
+
+    def _coord_to_pixel_x(self, x_coord: float, width_pixels: float) -> float:
+        xmin, xmax = self.mesh.bounds[0]
+        frac = (x_coord - xmin) / (xmax - xmin)
+        return frac * width_pixels
+
+    def _coord_to_pixel_y(self, y_coord: float, height_pixels: float) -> float:
+        ymin, ymax = self.mesh.bounds[1]
+        frac = (y_coord - ymin) / (ymax - ymin)
+        return frac * height_pixels
+
+    def mouseMoveEvent(self, event: QtGui.QMouseEvent):
+        # Show tooltip with index, coordinates, and value for hovered cell
+        pos = event.pos()
+        nx = self.mesh.cells[0]
+        ny = self.mesh.cells[1]
+        cell_w = self.width() / nx
+        cell_h = self.height() / ny
+        ix = int(pos.x() // cell_w)
+        iy = int(pos.y() // cell_h)
+        if ix < 0 or ix >= nx or iy < 0 or iy >= ny:
+            QtWidgets.QToolTip.hideText()
+            return
+        val = self.mesh.get_counts()[ix][iy]
+        centers = self.mesh.get_centers()
+        coord = (centers[0][ix], centers[1][iy])
+        tip = f"idx=({ix},{iy}) val={val:.6g}\ncenter=({coord[0]:.4f},{coord[1]:.4f})"
+        QtWidgets.QToolTip.showText(event.globalPos(), tip, self)
+
+    def leaveEvent(self, event):
+        QtWidgets.QToolTip.hideText()
+
+    def save_png(self, path: str):
+        """Save current widget rendering to PNG."""
+        pix = QtGui.QPixmap(self.size())
+        self.render(pix)
+        pix.save(path, "PNG")
+
+
+class MeshWindow(QtWidgets.QMainWindow):
+    """QMainWindow wrapper providing a menu and the MeshVisualizer as central widget."""
+
+    def __init__(self, mesh, peaks=None, true_points=None, show_values=False, blue_heatmap=False, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("MeshND Visualizer")
+        self.visualizer = MeshVisualizer(mesh, peaks=peaks, true_points=true_points, show_values=show_values, blue_heatmap=blue_heatmap)
+        self.setCentralWidget(self.visualizer)
+        self._create_menu()
+
+    def _create_menu(self):
+        menubar = self.menuBar()
+        file_menu = menubar.addMenu("&File")
+
+        save_action = QtGui.QAction("Save as PNG...", self)
+        save_action.triggered.connect(self._on_save_png)
+        file_menu.addAction(save_action)
+
+        quit_action = QtGui.QAction("Quit", self)
+        quit_action.triggered.connect(QtWidgets.QApplication.instance().quit)
+        file_menu.addAction(quit_action)
+
+    def _on_save_png(self):
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Save as PNG", "", "PNG files (*.png)")
+        if path:
+            self.visualizer.save_png(path)
+
+
+def run_gui(mesh, peaks=None, true_points=None, show_values=False, blue_heatmap=False):
+    """Helper: start QApplication and open MeshWindow."""
+    app = QtWidgets.QApplication.instance()
+    if app is None:
+        app = QtWidgets.QApplication([])
+    win = MeshWindow(mesh, peaks=peaks, true_points=true_points, show_values=show_values, blue_heatmap=blue_heatmap)
+    win.show()
+    app.exec_()
